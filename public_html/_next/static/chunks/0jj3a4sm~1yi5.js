@@ -1,0 +1,1 @@
+(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push(["object"==typeof document?document.currentScript:void 0,3141,e=>{"use strict";var t=e.i(87155),u=e.i(2417),c=e.i(838);e.s(["default",0,function(){let e,r,l=(0,t.c)(3),o=(0,c.useRouter)();return l[0]!==o?(e=()=>{o.replace("/products/aras-l")},r=[o],l[0]=o,l[1]=e,l[2]=r):(e=l[1],r=l[2]),(0,u.useEffect)(e,r),null}])}]);

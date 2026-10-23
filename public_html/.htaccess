@@ -1,0 +1,39 @@
+RewriteEngine On
+RewriteBase /
+
+# Güvenlik: data klasörüne dışarıdan doğrudan erişimi tamamen engelle
+RewriteRule ^data(/.*)?$ - [F,L]
+
+DirectoryIndex index.html
+RedirectMatch 302 ^/$ /tr/
+
+<IfModule mod_headers.c>
+  <FilesMatch "\.html$">
+    Header set Cache-Control "no-cache, no-store, must-revalidate, max-age=0"
+  </FilesMatch>
+</IfModule>
+
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType text/html "access plus 0 seconds"
+  ExpiresByType text/css "access plus 1 year"
+  ExpiresByType application/javascript "access plus 1 year"
+  ExpiresByType image/png "access plus 1 year"
+  ExpiresByType image/jpeg "access plus 1 year"
+  ExpiresByType image/webp "access plus 1 year"
+  ExpiresByType image/svg+xml "access plus 1 year"
+  ExpiresByType image/x-icon "access plus 1 year"
+  ExpiresByType font/woff2 "access plus 1 year"
+  ExpiresByType application/pdf "access plus 1 week"
+</IfModule>
+
+# Mevcut dosya veya dizin varsa doğrudan sun
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# Dinamik Ürün, Çözüm, Yazılım ve Sayfa Yönlendirmeleri (Fallback to view.php)
+RewriteRule ^(tr|en)/(products|urunler|solutions|cozumler|software|yazilim)/([^/]+)/?$ view.php?lang=$1&type=$2&slug=$3 [L,QSA]
+RewriteRule ^(products|urunler|solutions|cozumler|software|yazilim)/([^/]+)/?$ view.php?lang=tr&type=$1&slug=$2 [L,QSA]
+RewriteRule ^(tr|en)/p/([^/]+)/?$ view.php?lang=$1&type=page&slug=$2 [L,QSA]
+RewriteRule ^p/([^/]+)/?$ view.php?lang=tr&type=page&slug=$1 [L,QSA]
