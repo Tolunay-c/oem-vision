@@ -22,10 +22,9 @@ if (cms_serve($path)) {
     return true;
 }
 
-// Var olan dosyaları (css, js, görsel, php) sunucu kendisi versin
-if (is_file(CMS_PUBLIC . $path)) {
+// Var olan dosya ve klasörleri (css, js, görsel, php, /admin/) sunucu kendisi versin
+if (is_file(CMS_PUBLIC . $path) || is_dir(CMS_PUBLIC . $path)) {
     return false;
 }
 
-http_response_code(404);
-readfile(CMS_PUBLIC . '/404.html');
+cms_not_found($path);

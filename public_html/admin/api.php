@@ -1,656 +1,287 @@
 <?php
 /**
- * OEM Vision — Enterprise Admin Backend API
- * 
- * Handles Content CMS, Products, Solutions, Software, Pages, Navigation Menu,
- * Media Library, Inquiries/Inbox, Document PDFs, Rollback Snapshots & Settings.
+ * Panel API — JSON uç noktaları
  */
-
 declare(strict_types=1);
+require __DIR__ . '/bootstrap.php';
 
-require_once __DIR__ . '/config.php';
-
-header('Content-Type: application/json; charset=utf-8');
-
-// Oturum kontrolü
-if (!isAuthenticated()) {
-    http_response_code(401);
-    echo json_encode(['success' => false, 'message' => 'Yetkisiz erişim. Lütfen giriş yapınız.']);
-    exit;
+if (!admin_is_logged_in()) {
+    admin_json_response(['ok' => false, 'error' => 'Oturum süresi doldu. Lütfen tekrar giriş yapın.'], 401);
+}
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    admin_json_response(['ok' => false, 'error' => 'Geçersiz istek.'], 405);
 }
 
-$action = $_POST['action'] ?? $_GET['action'] ?? '';
+$input = json_decode((string) file_get_contents('php://input'), true);
+if (!is_array($input)) $input = $_POST;
 
-// CSRF kontrolü (POST istekleri için)
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $token = $_POST['csrf_token'] ?? '';
-    if (!verifyCsrfToken($token)) {
-        http_response_code(403);
-        echo json_encode(['success' => false, 'message' => 'CSRF güvenlik belirteci geçersiz.']);
-        exit;
-    }
+if (!admin_csrf_ok($input['csrf'] ?? ($_SERVER['HTTP_X_CSRF'] ?? null))) {
+    admin_json_response(['ok' => false, 'error' => 'Güvenlik doğrulaması başarısız. Sayfayı yenileyin.'], 403);
 }
 
-// =========================================================================
-// 1. AYARLAR & GÜVENLİK
-// =========================================================================
+$action = (string) ($input['action'] ?? '');
 
-// Ayarları Getir
-if ($action === 'get_settings') {
-    $settings = file_exists(SETTINGS_FILE) ? json_decode((string)file_get_contents(SETTINGS_FILE), true) : [];
-    echo json_encode(['success' => true, 'data' => $settings]);
-    exit;
-}
+switch ($action) {
 
-// Ayarları Kaydet
-if ($action === 'save_settings') {
-    $currentSettings = file_exists(SETTINGS_FILE) ? json_decode((string)file_get_contents(SETTINGS_FILE), true) : [];
+    /* Sayfa metinlerini kaydet: changes = { tr: {key: value}, en: {...} } */
+    case 'save_texts': {
+        $changes = $input['changes'] ?? null;
+        if (!is_array($changes)) admin_json_response(['ok' => false, 'error' => 'Değişiklik bulunamadı.'], 400);
 
-    $phone = trim((string)($_POST['phone'] ?? ''));
-    $gsm = trim((string)($_POST['gsm'] ?? ''));
-    $phoneClean = preg_replace('/[^\d+]/', '', $phone);
-    $gsmClean   = preg_replace('/[^\d+]/', '', $gsm);
+        $saved = 0;
+        foreach (CMS_LANGS as $lang) {
+            if (empty($changes[$lang]) || !is_array($changes[$lang])) continue;
+            $base = cms_base($lang);
+            $file = CMS_DATA . "/overrides_{$lang}.json";
+            $over = cms_read_json($file);
 
-    $updated = [
-        'general' => [
-            'company_name'       => trim((string)($_POST['company_name'] ?? 'OEM Vision')),
-            'company_full_title' => trim((string)($_POST['company_full_title'] ?? '')),
-            'phone'              => $phone,
-            'phone_clean'        => $phoneClean,
-            'gsm'                => $gsm,
-            'gsm_clean'          => $gsmClean,
-            'email'              => trim((string)($_POST['email'] ?? '')),
-            'notification_email' => trim((string)($_POST['notification_email'] ?? '')),
-            'address'            => trim((string)($_POST['address'] ?? '')),
-            'working_hours'      => trim((string)($_POST['working_hours'] ?? '')),
-            'google_maps_url'    => trim((string)($_POST['google_maps_url'] ?? '')),
-            'mersis_no'          => trim((string)($_POST['mersis_no'] ?? '')),
-            'kep_address'        => trim((string)($_POST['kep_address'] ?? '')),
-        ],
-        'social' => [
-            'linkedin'  => trim((string)($_POST['social_linkedin'] ?? '')),
-            'youtube'   => trim((string)($_POST['social_youtube'] ?? '')),
-            'instagram' => trim((string)($_POST['social_instagram'] ?? '')),
-            'x'         => trim((string)($_POST['social_x'] ?? '')),
-        ],
-        'docs' => $currentSettings['docs'] ?? [],
-        'updated_at' => date('Y-m-d H:i:s'),
-    ];
+            foreach ($changes[$lang] as $key => $value) {
+                $key = (string) $key;
+                if (!isset($base[$key]) || !is_string($value)) continue;
+                $value = str_replace("\r\n", "\n", $value);
+                // Sabit sayfa metinlerinde baştaki/sondaki boşluk metin akışının parçası, koru
+                if (cms_is_static_key($key)) {
+                    preg_match('/^\s*/u', $base[$key], $lead);
+                    preg_match('/\s*$/u', $base[$key], $trail);
+                    $value = $lead[0] . trim($value) . $trail[0];
+                }
+                if (mb_strlen($value) > 5000) $value = mb_substr($value, 0, 5000);
 
-    $result = @file_put_contents(SETTINGS_FILE, json_encode($updated, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    if ($result !== false) {
-        echo json_encode(['success' => true, 'message' => $t['saved_success']]);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Ayar dosyasına yazılamadı.']);
-    }
-    exit;
-}
+                if ($value === $base[$key]) {
+                    unset($over[$key]);          // orijinale dönüldü
+                } elseif (trim($value) === '') {
+                    continue;                    // boş metin sayfayı bozar, kabul etme
+                } else {
+                    $over[$key] = $value;
+                }
+                $saved++;
+            }
 
-// Şifre Değiştir
-if ($action === 'change_password') {
-    $currentPass = (string)($_POST['current_password'] ?? '');
-    $newPass     = (string)($_POST['new_password'] ?? '');
-    $confirmPass = (string)($_POST['new_password_confirm'] ?? '');
-
-    $auth = file_exists(AUTH_FILE) ? json_decode((string)file_get_contents(AUTH_FILE), true) : [];
-    $hash = $auth['password_hash'] ?? '';
-
-    if (!password_verify($currentPass, $hash)) {
-        echo json_encode(['success' => false, 'message' => 'Mevcut parola hatalı.']);
-        exit;
-    }
-    if (strlen($newPass) < 8) {
-        echo json_encode(['success' => false, 'message' => $t['password_too_short']]);
-        exit;
-    }
-    if ($newPass !== $confirmPass) {
-        echo json_encode(['success' => false, 'message' => $t['password_mismatch']]);
-        exit;
+            admin_backup_overrides($lang, 'Sayfa içerikleri kaydedildi');
+            ksort($over);
+            if (!admin_json_write($file, $over)) {
+                admin_json_response(['ok' => false, 'error' => "overrides_{$lang}.json yazılamadı. Klasör izinlerini kontrol edin."], 500);
+            }
+        }
+        admin_json_response(['ok' => true, 'saved' => $saved]);
     }
 
-    $auth['password_hash'] = password_hash($newPass, PASSWORD_BCRYPT);
-    $auth['updated_at'] = date('Y-m-d H:i:s');
-    @file_put_contents(AUTH_FILE, json_encode($auth, JSON_PRETTY_PRINT));
+    /* Görsel / doküman değiştir: type, path, file (multipart) */
+    case 'replace_media': {
+        $type = (string) ($input['type'] ?? '');
+        $path = (string) ($input['path'] ?? '');
+        if (!isset(ADMIN_MEDIA_TYPES[$type])) admin_json_response(['ok' => false, 'error' => 'Geçersiz tür.'], 400);
+        $files = admin_media_files($type);
+        if (!isset($files[$path])) admin_json_response(['ok' => false, 'error' => 'Dosya bulunamadı.'], 404);
+        $target = $files[$path];
 
-    echo json_encode(['success' => true, 'message' => $t['password_changed']]);
-    exit;
-}
+        $up = $_FILES['file'] ?? null;
+        if (!$up || ($up['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+            $err = (int) ($up['error'] ?? UPLOAD_ERR_NO_FILE);
+            $msg = in_array($err, [UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE], true)
+                ? 'Dosya sunucunun yükleme sınırını aşıyor (' . admin_bytes(admin_upload_limit()) . ').'
+                : 'Dosya yüklenemedi.';
+            admin_json_response(['ok' => false, 'error' => $msg], 400);
+        }
+        if ($up['size'] > ADMIN_MEDIA_TYPES[$type]['max']) {
+            admin_json_response(['ok' => false, 'error' => 'Dosya çok büyük. En fazla ' . admin_bytes(ADMIN_MEDIA_TYPES[$type]['max']) . '.'], 400);
+        }
+        $tmp = (string) $up['tmp_name'];
+        $warning = null;
 
-// =========================================================================
-// 2. GELEN FORMLAR & MESAJLAR (INBOX)
-// =========================================================================
+        if ($type === 'docs') {
+            $fh = fopen($tmp, 'rb');
+            $magic = $fh ? fread($fh, 5) : '';
+            if ($fh) fclose($fh);
+            if ($magic !== '%PDF-') admin_json_response(['ok' => false, 'error' => 'Sadece PDF dosyası yüklenebilir.'], 400);
+            $data = (string) file_get_contents($tmp);
+        } else {
+            $info = @getimagesize($tmp);
+            $okTypes = [IMAGETYPE_PNG => 'png', IMAGETYPE_JPEG => 'jpg', IMAGETYPE_WEBP => 'webp', IMAGETYPE_GIF => 'gif'];
+            if (!$info || !isset($okTypes[$info[2]])) {
+                admin_json_response(['ok' => false, 'error' => 'Sadece PNG, JPG, WEBP veya GIF görsel yüklenebilir.'], 400);
+            }
+            $want = strtolower(pathinfo($target, PATHINFO_EXTENSION));
+            $want = $want === 'jpeg' ? 'jpg' : $want;
+            $have = $okTypes[$info[2]];
 
-if ($action === 'get_messages') {
-    $messages = file_exists(MESSAGES_FILE) ? json_decode((string)file_get_contents(MESSAGES_FILE), true) ?: [] : [];
-    $unreadCount = 0;
-    foreach ($messages as $m) {
-        if (($m['status'] ?? '') === 'unread') $unreadCount++;
+            if ($have === $want) {
+                $data = (string) file_get_contents($tmp);
+            } elseif (function_exists('imagecreatefromstring')) {
+                // Farklı formatta yüklendi: dosya adı aynı kalacağı için hedef formata çevir
+                $img = @imagecreatefromstring((string) file_get_contents($tmp));
+                if (!$img) admin_json_response(['ok' => false, 'error' => 'Görsel okunamadı.'], 400);
+                ob_start();
+                $ok = match ($want) {
+                    'png'  => (function () use ($img) { imagesavealpha($img, true); return imagepng($img, null, 6); })(),
+                    'jpg'  => imagejpeg($img, null, 88),
+                    'webp' => function_exists('imagewebp') && imagewebp($img, null, 88),
+                    'gif'  => imagegif($img),
+                    default => false,
+                };
+                $data = (string) ob_get_clean();
+                imagedestroy($img);
+                if (!$ok || $data === '') admin_json_response(['ok' => false, 'error' => 'Görsel ' . strtoupper($want) . ' formatına çevrilemedi.'], 400);
+            } else {
+                admin_json_response(['ok' => false, 'error' => 'Lütfen görseli ' . strtoupper($want) . ' formatında yükleyin.'], 400);
+            }
+
+            // En-boy oranı çok farklıysa uyar
+            $old = @getimagesize($target);
+            if ($old && $old[1] > 0 && $info[1] > 0) {
+                $r1 = $old[0] / $old[1];
+                $r2 = $info[0] / $info[1];
+                if (abs($r1 - $r2) / $r1 > 0.08) {
+                    $warning = "Yeni görselin oranı farklı ({$info[0]}×{$info[1]}, orijinal {$old[0]}×{$old[1]}). Sitede kırpılmış veya farklı görünebilir.";
+                }
+            }
+        }
+
+        // İlk değişiklikte orijinali sakla
+        $orig = admin_media_original($path);
+        if (!is_file($orig)) {
+            if (!is_dir(dirname($orig))) mkdir(dirname($orig), 0755, true);
+            copy($target, $orig);
+        }
+        $tmpTarget = $target . '.upload' . bin2hex(random_bytes(4));
+        if (file_put_contents($tmpTarget, $data) === false || !rename($tmpTarget, $target)) {
+            @unlink($tmpTarget);
+            admin_json_response(['ok' => false, 'error' => 'Dosya yazılamadı. Klasör izinlerini kontrol edin.'], 500);
+        }
+        clearstatcache(true, $target);
+
+        $log = cms_read_json(ADMIN_MEDIA_LOG);
+        array_unshift($log, ['time' => time(), 'user' => $_SESSION['admin_user'] ?? '', 'action' => 'replace', 'path' => $path, 'name' => (string) $up['name']]);
+        admin_json_write(ADMIN_MEDIA_LOG, array_slice($log, 0, 500));
+
+        admin_json_response(['ok' => true, 'warning' => $warning, 'mtime' => filemtime($target)]);
     }
-    echo json_encode(['success' => true, 'messages' => $messages, 'unread_count' => $unreadCount]);
-    exit;
-}
 
-if ($action === 'update_message_status') {
-    $id = (string)($_POST['id'] ?? '');
-    $newStatus = (string)($_POST['status'] ?? 'read');
-    $messages = file_exists(MESSAGES_FILE) ? json_decode((string)file_get_contents(MESSAGES_FILE), true) ?: [] : [];
-    
-    $found = false;
-    foreach ($messages as &$m) {
-        if ($m['id'] === $id) {
-            $m['status'] = $newStatus;
+    /* Görsel / dokümanı orijinaline döndür */
+    case 'restore_media': {
+        $type = (string) ($input['type'] ?? '');
+        $path = (string) ($input['path'] ?? '');
+        if (!isset(ADMIN_MEDIA_TYPES[$type])) admin_json_response(['ok' => false, 'error' => 'Geçersiz tür.'], 400);
+        $files = admin_media_files($type);
+        $orig = admin_media_original($path);
+        if (!isset($files[$path]) || !is_file($orig)) admin_json_response(['ok' => false, 'error' => 'Orijinal dosya bulunamadı.'], 404);
+
+        if (!copy($orig, $files[$path])) admin_json_response(['ok' => false, 'error' => 'Dosya geri yüklenemedi.'], 500);
+        unlink($orig);
+
+        $log = cms_read_json(ADMIN_MEDIA_LOG);
+        array_unshift($log, ['time' => time(), 'user' => $_SESSION['admin_user'] ?? '', 'action' => 'restore', 'path' => $path]);
+        admin_json_write(ADMIN_MEDIA_LOG, array_slice($log, 0, 500));
+        admin_json_response(['ok' => true]);
+    }
+
+    /* Mesaj durumu: id, status (read|unread) ya da delete */
+    case 'message_status':
+    case 'message_delete': {
+        $id = (string) ($input['id'] ?? '');
+        $file = CMS_DATA . '/messages.json';
+        $fh = fopen($file, 'c+');
+        if (!$fh || !flock($fh, LOCK_EX)) admin_json_response(['ok' => false, 'error' => 'Mesaj dosyası açılamadı.'], 500);
+        $msgs = json_decode((string) stream_get_contents($fh), true);
+        $msgs = is_array($msgs) ? $msgs : [];
+        $found = false;
+        foreach ($msgs as $i => $m) {
+            if (!is_array($m) || (string) ($m['id'] ?? '') !== $id) continue;
             $found = true;
-            break;
+            if ($action === 'message_delete') {
+                unset($msgs[$i]);
+            } else {
+                $msgs[$i]['status'] = ($input['status'] ?? '') === 'unread' ? 'unread' : 'read';
+            }
         }
-    }
-    unset($m);
-
-    if ($found) {
-        @file_put_contents(MESSAGES_FILE, json_encode($messages, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-        echo json_encode(['success' => true, 'message' => 'Mesaj durumu güncellendi.']);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Mesaj bulunamadı.']);
-    }
-    exit;
-}
-
-if ($action === 'delete_message') {
-    $id = (string)($_POST['id'] ?? '');
-    $messages = file_exists(MESSAGES_FILE) ? json_decode((string)file_get_contents(MESSAGES_FILE), true) ?: [] : [];
-    
-    $filtered = array_values(array_filter($messages, fn($m) => $m['id'] !== $id));
-    @file_put_contents(MESSAGES_FILE, json_encode($filtered, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-    echo json_encode(['success' => true, 'message' => 'Mesaj silindi.']);
-    exit;
-}
-
-// =========================================================================
-// 3. İÇERİK CMS & VERSİYON ROLLBACK
-// =========================================================================
-
-// İçerik Getir
-if ($action === 'get_content') {
-    $targetLang = ($_GET['lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-    $content = file_exists($targetFile) ? json_decode((string)file_get_contents($targetFile), true) : [];
-    echo json_encode(['success' => true, 'lang' => $targetLang, 'data' => $content]);
-    exit;
-}
-
-// İçerik Kaydet (Otomatik Snapshot Alarak)
-if ($action === 'save_content') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-
-    $rawContent = $_POST['content_json'] ?? '';
-    $decoded = json_decode($rawContent, true);
-
-    if (!is_array($decoded)) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz veri formatı.']);
-        exit;
-    }
-
-    // Yedek / Snapshot al
-    createContentSnapshot($targetLang, 'İçerik güncellemesi');
-
-    $result = @file_put_contents($targetFile, json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    if ($result !== false) {
-        echo json_encode(['success' => true, 'message' => $t['saved_success']]);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'İçerik dosyasına yazılamadı.']);
-    }
-    exit;
-}
-
-// Taslak Olarak Kaydet (Draft)
-if ($action === 'save_draft') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $draftFile = DATA_DIR . '/content_' . $targetLang . '_draft.json';
-
-    $rawContent = $_POST['content_json'] ?? '';
-    $decoded = json_decode($rawContent, true);
-
-    if (!is_array($decoded)) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz veri formatı.']);
-        exit;
-    }
-
-    $result = @file_put_contents($draftFile, json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    echo json_encode(['success' => $result !== false, 'message' => 'Taslak kaydedildi. ?preview=1 ile önizleyebilirsiniz.']);
-    exit;
-}
-
-// Taslağı Canlıya Al (Publish)
-if ($action === 'publish_draft') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $draftFile = DATA_DIR . '/content_' . $targetLang . '_draft.json';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-
-    if (!file_exists($draftFile)) {
-        echo json_encode(['success' => false, 'message' => 'Yayınlanacak taslak bulunamadı.']);
-        exit;
-    }
-
-    createContentSnapshot($targetLang, 'Taslak yayına alındı');
-    @copy($draftFile, $targetFile);
-    @unlink($draftFile);
-    echo json_encode(['success' => true, 'message' => 'Taslak başarıyla yayına alındı!']);
-    exit;
-}
-
-// Yedekleri / Snapshot Listesini Getir
-if ($action === 'list_backups') {
-    $targetLang = ($_GET['lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $files = glob(BACKUPS_DIR . '/content_' . $targetLang . '_*.json') ?: [];
-    
-    usort($files, fn($a, $b) => filemtime($b) <=> filemtime($a));
-
-    $backups = [];
-    foreach ($files as $f) {
-        $name = basename($f);
-        // format: content_tr_YYYYMMDD_HHMMSS.json
-        preg_match('/content_[a-z]+_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.json/', $name, $matches);
-        $formattedDate = $matches ? "{$matches[1]}-{$matches[2]}-{$matches[3]} {$matches[4]}:{$matches[5]}:{$matches[6]}" : date('Y-m-d H:i:s', filemtime($f));
-
-        $backups[] = [
-            'filename' => $name,
-            'date' => $formattedDate,
-            'size' => round(filesize($f) / 1024, 1) . ' KB',
-        ];
-    }
-
-    echo json_encode(['success' => true, 'backups' => $backups]);
-    exit;
-}
-
-// Sürüme Geri Dön (Rollback)
-if ($action === 'restore_backup') {
-    $filename = basename((string)($_POST['filename'] ?? ''));
-    $backupPath = BACKUPS_DIR . '/' . $filename;
-
-    if (!file_exists($backupPath)) {
-        echo json_encode(['success' => false, 'message' => 'Yedek dosyası bulunamadı.']);
-        exit;
-    }
-
-    $isEn = str_contains($filename, 'content_en_');
-    $targetLang = $isEn ? 'en' : 'tr';
-    $targetFile = $isEn ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-
-    // Geri dönmeden önce de mevcut halin bir kopyasını al
-    createContentSnapshot($targetLang, 'Geri alma öncesi otomatik snapshot');
-
-    $result = @copy($backupPath, $targetFile);
-    if ($result) {
-        echo json_encode(['success' => true, 'message' => 'Sürüm başarıyla geri yüklendi ve canlıya alındı!']);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Sürüm geri yüklenirken hata oluştu.']);
-    }
-    exit;
-}
-
-// =========================================================================
-// 4. ÜRÜN YÖNETİMİ (PRODUCTS CRUD)
-// =========================================================================
-
-if ($action === 'save_product') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-
-    $content = file_exists($targetFile) ? json_decode((string)file_get_contents($targetFile), true) ?: [] : [];
-    $productList = $content['products']['list'] ?? [];
-
-    $prodJson = $_POST['product_json'] ?? '';
-    $productData = json_decode($prodJson, true);
-
-    if (!is_array($productData) || empty($productData['name'])) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz ürün verisi.']);
-        exit;
-    }
-
-    $id = trim((string)($productData['id'] ?? ''));
-    if (empty($id)) {
-        $id = strtolower(trim(preg_replace('/[^a-zA-Z0-9]+/', '-', $productData['name']), '-'));
-        $productData['id'] = $id;
-    }
-    if (empty($productData['slug'])) {
-        $productData['slug'] = $id;
-    }
-
-    // Varsa güncelle, yoksa ekle
-    $foundIndex = -1;
-    foreach ($productList as $idx => $p) {
-        if ($p['id'] === $id) {
-            $foundIndex = $idx;
-            break;
+        if ($found) {
+            ftruncate($fh, 0);
+            rewind($fh);
+            fwrite($fh, json_encode(array_values($msgs), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
         }
+        flock($fh, LOCK_UN);
+        fclose($fh);
+        admin_json_response($found ? ['ok' => true] : ['ok' => false, 'error' => 'Mesaj bulunamadı.'], $found ? 200 : 404);
     }
 
-    if ($foundIndex >= 0) {
-        $productList[$foundIndex] = $productData;
-    } else {
-        $productList[] = $productData;
-    }
-
-    // Sıralamaya göre diz
-    usort($productList, fn($a, $b) => ($a['sort_order'] ?? 99) <=> ($b['sort_order'] ?? 99));
-
-    $content['products']['list'] = $productList;
-
-    createContentSnapshot($targetLang, 'Ürün kaydedildi: ' . $productData['name']);
-    @file_put_contents($targetFile, json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-
-    echo json_encode(['success' => true, 'message' => 'Ürün başarıyla kaydedildi!', 'product' => $productData]);
-    exit;
-}
-
-if ($action === 'delete_product') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-    $id = (string)($_POST['id'] ?? '');
-
-    $content = file_exists($targetFile) ? json_decode((string)file_get_contents($targetFile), true) ?: [] : [];
-    $productList = $content['products']['list'] ?? [];
-
-    $filtered = array_values(array_filter($productList, fn($p) => $p['id'] !== $id));
-    $content['products']['list'] = $filtered;
-
-    createContentSnapshot($targetLang, 'Ürün silindi: ' . $id);
-    @file_put_contents($targetFile, json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-
-    echo json_encode(['success' => true, 'message' => 'Ürün başarıyla silindi.']);
-    exit;
-}
-
-// =========================================================================
-// 5. ÇÖZÜMLER & YAZILIMLAR & ÖZEL SAYFALAR (CRUD)
-// =========================================================================
-
-// Çözüm Kaydet
-if ($action === 'save_solution') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-    $content = file_exists($targetFile) ? json_decode((string)file_get_contents($targetFile), true) ?: [] : [];
-
-    $data = json_decode($_POST['data_json'] ?? '', true);
-    if (!is_array($data) || empty($data['title'])) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz çözüm verisi.']);
-        exit;
-    }
-
-    $id = trim((string)($data['id'] ?? ''));
-    if (empty($id)) $id = strtolower(trim(preg_replace('/[^a-zA-Z0-9]+/', '-', $data['title']), '-'));
-    $data['id'] = $id;
-    if (empty($data['slug'])) $data['slug'] = $id;
-
-    $list = $content['solutions']['list'] ?? [];
-    $found = false;
-    foreach ($list as &$item) {
-        if ($item['id'] === $id) {
-            $item = $data;
-            $found = true;
-            break;
+    /* Firma bilgilerini kaydet: values = {alan: {tr: "...", en: "..."}}, notification_email */
+    case 'save_company': {
+        $values = is_array($input['values'] ?? null) ? $input['values'] : [];
+        $fields = admin_company_fields();
+        $notify = trim((string) ($input['notification_email'] ?? ''));
+        if ($notify !== '' && !filter_var($notify, FILTER_VALIDATE_EMAIL)) {
+            admin_json_response(['ok' => false, 'error' => 'Bildirim e-postası geçerli değil.'], 400);
         }
-    }
-    unset($item);
-    if (!$found) $list[] = $data;
-
-    $content['solutions']['list'] = $list;
-    createContentSnapshot($targetLang, 'Çözüm kaydedildi: ' . $data['title']);
-    @file_put_contents($targetFile, json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    echo json_encode(['success' => true, 'message' => 'Çözüm başarıyla kaydedildi!']);
-    exit;
-}
-
-// Yazılım Kaydet
-if ($action === 'save_software') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-    $content = file_exists($targetFile) ? json_decode((string)file_get_contents($targetFile), true) ?: [] : [];
-
-    $data = json_decode($_POST['data_json'] ?? '', true);
-    if (!is_array($data) || empty($data['title'])) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz yazılım verisi.']);
-        exit;
-    }
-
-    $id = trim((string)($data['id'] ?? ''));
-    if (empty($id)) $id = strtolower(trim(preg_replace('/[^a-zA-Z0-9]+/', '-', $data['title']), '-'));
-    $data['id'] = $id;
-    if (empty($data['slug'])) $data['slug'] = $id;
-
-    $list = $content['software']['list'] ?? [];
-    $found = false;
-    foreach ($list as &$item) {
-        if ($item['id'] === $id) {
-            $item = $data;
-            $found = true;
-            break;
+        if (!empty($values['email']['tr']) && !filter_var(trim((string) $values['email']['tr']), FILTER_VALIDATE_EMAIL)) {
+            admin_json_response(['ok' => false, 'error' => 'E-posta adresi geçerli değil.'], 400);
         }
-    }
-    unset($item);
-    if (!$found) $list[] = $data;
 
-    $content['software']['list'] = $list;
-    createContentSnapshot($targetLang, 'Yazılım kaydedildi: ' . $data['title']);
-    @file_put_contents($targetFile, json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    echo json_encode(['success' => true, 'message' => 'Yazılım başarıyla kaydedildi!']);
-    exit;
-}
+        $over = [];
+        foreach (CMS_LANGS as $l) $over[$l] = cms_read_json(CMS_DATA . "/overrides_{$l}.json");
+        $links = cms_read_json(CMS_DATA . '/link_overrides.json');
 
-// Özel Sayfa Kaydet
-if ($action === 'save_page') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-    $content = file_exists($targetFile) ? json_decode((string)file_get_contents($targetFile), true) ?: [] : [];
-
-    $data = json_decode($_POST['data_json'] ?? '', true);
-    if (!is_array($data) || empty($data['title'])) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz sayfa verisi.']);
-        exit;
-    }
-
-    $id = trim((string)($data['id'] ?? ''));
-    if (empty($id)) $id = strtolower(trim(preg_replace('/[^a-zA-Z0-9]+/', '-', $data['title']), '-'));
-    $data['id'] = $id;
-    if (empty($data['slug'])) $data['slug'] = $id;
-
-    $list = $content['custom_pages'] ?? [];
-    $found = false;
-    foreach ($list as &$item) {
-        if ($item['id'] === $id) {
-            $item = $data;
-            $found = true;
-            break;
+        foreach ($fields as $id => $f) {
+            if (!isset($values[$id]) || !is_array($values[$id])) continue;
+            foreach (CMS_LANGS as $l) {
+                $val = trim(str_replace("\r\n", "\n", (string) ($f['per_lang'] ? ($values[$id][$l] ?? '') : ($values[$id]['tr'] ?? ''))));
+                if ($val === '') continue;
+                $base = cms_base($l);
+                $targets = [];
+                foreach ($f['keys'] as $k) $targets[$k] = $val;
+                foreach ($f['flat_keys'] ?? [] as $k) $targets[$k] = trim((string) preg_replace('/\s*\n\s*/', ' ', $val));
+                foreach ($targets as $k => $v) {
+                    if (!isset($base[$k])) continue;
+                    if ($v === $base[$k]) unset($over[$l][$k]); else $over[$l][$k] = $v;
+                }
+            }
+            // tel: / mailto: linkleri (orijinal linkten yeni linke)
+            if (!empty($f['link'])) {
+                $origVal = (string) (cms_base('tr')[$f['keys'][0]] ?? '');
+                $newVal = trim((string) ($values[$id]['tr'] ?? ''));
+                if ($origVal !== '' && $newVal !== '') {
+                    $from = $f['link'] === 'tel' ? admin_tel_link($origVal) : 'mailto:' . $origVal;
+                    $to   = $f['link'] === 'tel' ? admin_tel_link($newVal) : 'mailto:' . $newVal;
+                    if ($from === $to) unset($links[$from]); else $links[$from] = $to;
+                }
+            }
         }
-    }
-    unset($item);
-    if (!$found) $list[] = $data;
 
-    $content['custom_pages'] = $list;
-    createContentSnapshot($targetLang, 'Özel sayfa kaydedildi: ' . $data['title']);
-    @file_put_contents($targetFile, json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    echo json_encode(['success' => true, 'message' => 'Sayfa başarıyla kaydedildi!']);
-    exit;
+        foreach (CMS_LANGS as $l) {
+            admin_backup_overrides($l, 'Firma bilgileri kaydedildi');
+            ksort($over[$l]);
+            if (!admin_json_write(CMS_DATA . "/overrides_{$l}.json", $over[$l])) {
+                admin_json_response(['ok' => false, 'error' => 'Kaydedilemedi. data klasörünün yazma iznini kontrol edin.'], 500);
+            }
+        }
+        admin_json_write(CMS_DATA . '/link_overrides.json', $links);
+
+        // Form bildirim adresi (contact-handler.php settings.json'dan okur)
+        $settings = cms_read_json(CMS_DATA . '/settings.json');
+        $settings['general'] = (array) ($settings['general'] ?? []);
+        $settings['general']['notification_email'] = $notify;
+        $settings['updated_at'] = date('c');
+        admin_json_write(CMS_DATA . '/settings.json', $settings);
+
+        admin_json_response(['ok' => true]);
+    }
+
+    /* Sürüm geçmişinden geri yükle */
+    case 'restore_backup': {
+        $name = basename((string) ($input['name'] ?? ''));
+        $index = cms_read_json(ADMIN_BACKUP_DIR . '/index.json');
+        $file = ADMIN_BACKUP_DIR . '/' . $name;
+        if (!preg_match('/^overrides_(tr|en)_[0-9-]+\.json$/', $name) || !isset($index[$name]) || !is_file($file)) {
+            admin_json_response(['ok' => false, 'error' => 'Yedek bulunamadı.'], 404);
+        }
+        $lang = (string) $index[$name]['lang'];
+        $data = cms_read_json($file);
+        admin_backup_overrides($lang, 'Geri yüklemeden önceki hâl');
+        if (!admin_json_write(CMS_DATA . "/overrides_{$lang}.json", $data)) {
+            admin_json_response(['ok' => false, 'error' => 'Geri yüklenemedi.'], 500);
+        }
+        admin_json_response(['ok' => true]);
+    }
+
+    default:
+        admin_json_response(['ok' => false, 'error' => 'Bilinmeyen işlem.'], 400);
 }
-
-// Menü Kaydet
-if ($action === 'save_menu') {
-    $targetLang = ($_POST['target_lang'] ?? 'tr') === 'en' ? 'en' : 'tr';
-    $targetFile = $targetLang === 'en' ? CONTENT_EN_FILE : CONTENT_TR_FILE;
-    $content = file_exists($targetFile) ? json_decode((string)file_get_contents($targetFile), true) ?: [] : [];
-
-    $menu = json_decode($_POST['menu_json'] ?? '', true);
-    if (!is_array($menu)) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz menü verisi.']);
-        exit;
-    }
-
-    $content['menu'] = $menu;
-    createContentSnapshot($targetLang, 'Menü güncellendi');
-    @file_put_contents($targetFile, json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    echo json_encode(['success' => true, 'message' => 'Menü yapısı başarıyla kaydedildi!']);
-    exit;
-}
-
-// =========================================================================
-// 6. MEDYA KÜTÜPHANESİ (IMAGE UPLOAD & GALLERY)
-// =========================================================================
-
-// Medya Listele
-if ($action === 'list_media') {
-    $files = glob(MEDIA_DIR . '/*.{jpg,jpeg,png,webp,svg,gif}', GLOB_BRACE) ?: [];
-    usort($files, fn($a, $b) => filemtime($b) <=> filemtime($a));
-
-    $media = [];
-    foreach ($files as $f) {
-        $name = basename($f);
-        $media[] = [
-            'name' => $name,
-            'url' => '/uploads/images/' . $name,
-            'size' => round(filesize($f) / 1024, 1) . ' KB',
-            'date' => date('Y-m-d H:i', filemtime($f)),
-        ];
-    }
-    echo json_encode(['success' => true, 'media' => $media]);
-    exit;
-}
-
-// Medya Yükle
-if ($action === 'upload_media') {
-    if (empty($_FILES['image_file']) || $_FILES['image_file']['error'] !== UPLOAD_ERR_OK) {
-        echo json_encode(['success' => false, 'message' => 'Görsel dosyası yüklenemedi.']);
-        exit;
-    }
-
-    $file = $_FILES['image_file'];
-    $allowedExts = ['jpg', 'jpeg', 'png', 'webp', 'svg', 'gif'];
-    $ext = strtolower(pathinfo((string)$file['name'], PATHINFO_EXTENSION));
-
-    if (!in_array($ext, $allowedExts, true)) {
-        echo json_encode(['success' => false, 'message' => 'Desteklenmeyen dosya türü. (Yalnızca JPG, PNG, WEBP, SVG, GIF)']);
-        exit;
-    }
-
-    if ($file['size'] > 15 * 1024 * 1024) {
-        echo json_encode(['success' => false, 'message' => 'Dosya boyutu 15 MB sınırını aşıyor.']);
-        exit;
-    }
-
-    $cleanName = preg_replace('/[^a-zA-Z0-9_\.-]/', '_', pathinfo((string)$file['name'], PATHINFO_FILENAME));
-    $finalName = $cleanName . '_' . time() . '.' . $ext;
-    $targetPath = MEDIA_DIR . '/' . $finalName;
-
-    if (move_uploaded_file($file['tmp_name'], $targetPath)) {
-        echo json_encode([
-            'success' => true,
-            'message' => 'Görsel başarıyla yüklendi!',
-            'url' => '/uploads/images/' . $finalName,
-            'filename' => $finalName
-        ]);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Dosya taşınamadı. İzinleri kontrol ediniz.']);
-    }
-    exit;
-}
-
-// Medya Sil
-if ($action === 'delete_media') {
-    $filename = basename((string)($_POST['filename'] ?? ''));
-    $targetPath = MEDIA_DIR . '/' . $filename;
-
-    if (file_exists($targetPath)) {
-        @unlink($targetPath);
-        echo json_encode(['success' => true, 'message' => 'Görsel başarıyla silindi.']);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Görsel bulunamadı.']);
-    }
-    exit;
-}
-
-// =========================================================================
-// 7. DOKÜMAN & PDF YÖNETİMİ
-// =========================================================================
-
-if ($action === 'get_doc_list') {
-    $list = [];
-    foreach ($docCatalog as $key => $info) {
-        $trFile = $info['tr'];
-        $enFile = $info['en'];
-        $trPath = DOCS_DIR . '/' . $trFile;
-        $enPath = DOCS_DIR . '/' . $enFile;
-
-        $list[] = [
-            'key' => $key,
-            'name' => $info['name'],
-            'tr' => [
-                'filename' => $trFile,
-                'exists' => file_exists($trPath),
-                'size' => file_exists($trPath) ? round(filesize($trPath) / 1024, 1) . ' KB' : 'Yok',
-                'url' => '/docs/' . $trFile,
-                'updated' => file_exists($trPath) ? date('Y-m-d H:i', filemtime($trPath)) : '-',
-            ],
-            'en' => [
-                'filename' => $enFile,
-                'exists' => file_exists($enPath),
-                'size' => file_exists($enPath) ? round(filesize($enPath) / 1024, 1) . ' KB' : 'None',
-                'url' => '/docs/' . $enFile,
-                'updated' => file_exists($enPath) ? date('Y-m-d H:i', filemtime($enPath)) : '-',
-            ]
-        ];
-    }
-    echo json_encode(['success' => true, 'docs' => $list]);
-    exit;
-}
-
-if ($action === 'upload_pdf') {
-    if (empty($_FILES['pdf_file']) || $_FILES['pdf_file']['error'] !== UPLOAD_ERR_OK) {
-        echo json_encode(['success' => false, 'message' => 'Dosya yüklenemedi veya seçim yapılmadı.']);
-        exit;
-    }
-
-    $file = $_FILES['pdf_file'];
-    $docKey = (string)($_POST['doc_key'] ?? '');
-    $docLang = (string)($_POST['doc_lang'] ?? 'tr');
-
-    if (!isset($docCatalog[$docKey])) {
-        echo json_encode(['success' => false, 'message' => 'Geçersiz doküman kategorisi.']);
-        exit;
-    }
-
-    $ext = strtolower(pathinfo((string)$file['name'], PATHINFO_EXTENSION));
-    if ($ext !== 'pdf') {
-        echo json_encode(['success' => false, 'message' => 'Yalnızca PDF dosyaları (.pdf) yüklenebilir.']);
-        exit;
-    }
-
-    if ($file['size'] > 30 * 1024 * 1024) {
-        echo json_encode(['success' => false, 'message' => 'PDF dosyası 30 MB sınırından büyük olamaz.']);
-        exit;
-    }
-
-    $targetFileName = $docCatalog[$docKey][$docLang] ?? null;
-    if (!$targetFileName) {
-        echo json_encode(['success' => false, 'message' => 'Hedef dosya adı bulunamadı.']);
-        exit;
-    }
-
-    $targetPath = DOCS_DIR . '/' . $targetFileName;
-    if (!is_dir(DOCS_DIR)) @mkdir(DOCS_DIR, 0755, true);
-
-    if (move_uploaded_file($file['tmp_name'], $targetPath)) {
-        echo json_encode([
-            'success' => true,
-            'message' => 'PDF başarıyla yüklendi ve canlı sitede güncellendi!',
-            'filename' => $targetFileName,
-            'url' => '/docs/' . $targetFileName . '?v=' . time(),
-        ]);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'PDF sunucuya kaydedilemedi. Klasör izinlerini kontrol ediniz.']);
-    }
-    exit;
-}
-
-// Bilinmeyen eylem
-http_response_code(400);
-echo json_encode(['success' => false, 'message' => 'Geçersiz işlem parametresi.']);
